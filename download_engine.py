@@ -93,6 +93,7 @@ class VideoList:
     title: str
     videos: list[Video]
     playlist: bool
+    source_url: str = ""
 
 
 class DownloadEngine:
@@ -162,7 +163,7 @@ class DownloadEngine:
                                 video_url, entry.get("duration")))
         if not videos:
             raise RuntimeError("다운로드할 영상이 없습니다. 재생목록의 공개 여부를 확인해 주세요.")
-        return VideoList(info.get("title") or "재생목록", videos, playlist)
+        return VideoList(info.get("title") or "재생목록", videos, playlist, url)
 
     def progress(self, data: dict) -> None:
         check_cancel(self.cancel)

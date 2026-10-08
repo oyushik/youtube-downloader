@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import ctypes
-import os
 from pathlib import Path
 import queue
+import sqlite3
 import tempfile
 import threading
 import tkinter as tk
@@ -13,6 +13,8 @@ from tkinter.scrolledtext import ScrolledText
 
 from app_runtime import BundledRuntime, Cancelled
 from download_engine import DownloadEngine, VideoList, validate_url
+from download_history import DownloadHistory
+from history_window import HistoryWindow
 
 
 def duration_text(seconds: float | None) -> str:
@@ -24,7 +26,7 @@ def duration_text(seconds: float | None) -> str:
 
 
 class DownloadApp:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, history_path: Path | None = None):
         self.root = root
         root.title("YouTube 다운로드")
         root.geometry("980x780")
@@ -38,7 +40,10 @@ class DownloadApp:
         self.log_visible = False
         self.step = 0
         self.listing: VideoList | None = None
-        self.output_folder: Path | None = None
+        self.history = DownloadHistory(history_path)
+        self.history_window: HistoryWindow | None = None
+        self.active_history_id: int | None = None
+        self.history_warning = ""
         self.mode = tk.StringVar(value="single")
         self.url = tk.StringVar()
         self.folder = tk.StringVar()
@@ -106,8 +111,8 @@ class DownloadApp:
         self.back_button.pack(side="left")
         self.cancel_button = ttk.Button(footer, text="중지", command=self.stop)
         self.cancel_button.pack(side="left", padx=8)
-        self.open_button = ttk.Button(footer, text="저장 폴더 열기", command=self.open_folder)
-        self.open_button.pack(side="left")
+        self.history_button = ttk.Button(footer, text="다운로드 내역", command=self.open_history)
+        self.history_button.pack(side="left")
         self.next_button = ttk.Button(footer, text="목록 불러오기", command=self.next, style="Accent.TButton")
         self.next_button.pack(side="right")
 
@@ -204,7 +209,6 @@ class DownloadApp:
         self.cancel_button.configure(state="normal" if self.busy and not self.cancel.is_set() else "disabled")
         self.next_button.configure(text=("목록 불러오기", "저장 설정", "다운로드 시작", "새 다운로드")[self.step],
                                    state="disabled" if self.busy else "normal")
-        self.open_button.configure(state="normal" if self.output_folder and self.output_folder.is_dir() else "disabled")
         self.url_entry.configure(state="disabled" if self.busy else "normal")
         for radio in self.radios:
             radio.configure(state="disabled" if self.busy else "normal")
@@ -246,7 +250,6 @@ class DownloadApp:
             self.overall_bar["value"] = 0
             self.file_bar["value"] = 0
             self.progress_text.set("다운로드 준비 중…")
-            self.output_folder = destination
             self.show_step(3)
             self.start_task("download", listing=self.listing, destination=destination,
                             numbered=self.numbered.get(), separate=self.separate.get())
@@ -263,6 +266,7 @@ class DownloadApp:
     def start_task(self, operation: str, **arguments) -> None:
         self.cancel.clear()
         self.busy = True
+        self.history_warning = ""
         self.status.set("다운로드 준비 중…")
         self.loading.configure(mode="indeterminate")
         self.loading.start(12)
@@ -272,17 +276,44 @@ class DownloadApp:
         self.log_text.configure(state="disabled")
 
         def worker() -> None:
+            history_id = None
+            history_failed = False
+
+            def record(action, *args):
+                nonlocal history_failed
+                try:
+                    return action(*args)
+                except (OSError, sqlite3.Error) as error:
+                    if not history_failed:
+                        history_failed = True
+                        self.emit("history_warning", {"message": str(error)})
+
+            def download_event(kind, data):
+                if history_id is not None:
+                    record(self.history.record_event, history_id, kind, data)
+                self.emit(kind, data)
+
             try:
+                if operation == "download":
+                    history_id = record(self.history.start, arguments["listing"], arguments["destination"])
+                    self.emit("history_started", {"id": history_id})
                 with BundledRuntime(self.cancel) as runtime:
-                    engine = DownloadEngine(runtime, self.cancel, self.emit)
+                    engine = DownloadEngine(runtime, self.cancel, download_event)
                     if operation == "inspect":
                         self.emit("status", {"message": "영상 목록을 불러오는 중…"})
                         self.emit("listing", {"listing": engine.inspect(**arguments)})
                     else:
-                        self.emit("complete", engine.download(**arguments))
+                        result = engine.download(**arguments)
+                        if history_id is not None:
+                            record(self.history.finish, history_id, "complete")
+                        self.emit("complete", result)
             except Cancelled:
+                if history_id is not None:
+                    record(self.history.finish, history_id, "cancelled")
                 self.emit("cancelled", {})
             except Exception as error:
+                if history_id is not None:
+                    record(self.history.finish, history_id, "error", str(error))
                 self.emit("error", {"message": str(error) or type(error).__name__})
             finally:
                 self.emit("idle", {})
@@ -353,9 +384,12 @@ class DownloadApp:
                 if data.get("eta") is not None:
                     detail += f"  ·  남은 시간 {duration_text(data['eta'])}"
                 self.progress_text.set(detail)
-            elif kind == "folder":
-                self.output_folder = Path(data["path"])
-                self.refresh_buttons()
+            elif kind == "history_started":
+                self.active_history_id = data["id"]
+                self.refresh_history()
+            elif kind == "history_warning":
+                self.history_warning = data["message"]
+                self.append_log("다운로드 내역 저장 실패: " + self.history_warning)
             elif kind == "complete":
                 self.status.set(f"다운로드 완료 — 성공 {data['success']}개 / 실패 {len(data['failed'])}개")
                 self.progress_text.set("모든 영상의 처리가 끝났습니다.")
@@ -373,10 +407,16 @@ class DownloadApp:
                     messagebox.showerror("작업 실패", data["message"], parent=self.root)
             elif kind == "idle":
                 self.busy = False
+                self.active_history_id = None
                 self.loading.stop()
                 self.loading.configure(mode="determinate")
                 self.loading["value"] = 0
                 self.refresh_buttons()
+                self.refresh_history()
+                if self.history_warning and not self.closing:
+                    messagebox.showwarning("다운로드 내역 저장 실패",
+                                           "다운로드 결과와 별개로 내역을 저장하지 못했습니다.\n" + self.history_warning,
+                                           parent=self.root)
         if self.closing and not self.busy:
             self.root.destroy()
         else:
@@ -395,12 +435,17 @@ class DownloadApp:
         else:
             self.root.destroy()
 
-    def open_folder(self) -> None:
-        if self.output_folder:
-            try:
-                os.startfile(self.output_folder)
-            except OSError as error:
-                messagebox.showerror("폴더 열기 실패", str(error), parent=self.root)
+    def open_history(self) -> None:
+        if self.history_window is not None and self.history_window.winfo_exists():
+            self.history_window.refresh()
+            self.history_window.deiconify()
+            self.history_window.lift()
+        else:
+            self.history_window = HistoryWindow(self.root, self.history, lambda: self.active_history_id)
+
+    def refresh_history(self) -> None:
+        if self.history_window is not None and self.history_window.winfo_exists():
+            self.history_window.refresh()
 
     def toggle_log(self) -> None:
         if self.log_visible:

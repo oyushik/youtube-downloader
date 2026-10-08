@@ -11,7 +11,8 @@ import yt_dlp
 from yt_dlp.extractor.youtube.pot._registry import _pot_providers
 
 from app_runtime import BundledRuntime, run_tool
-from download_engine import DownloadEngine
+from download_engine import DownloadEngine, Video, VideoList
+from download_history import DownloadHistory
 
 
 def run(report_path: Path, test_url: str | None = None, playlist_url: str | None = None) -> int:
@@ -19,6 +20,7 @@ def run(report_path: Path, test_url: str | None = None, playlist_url: str | None
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report = {"ok": False, "checks": {}, "events": []}
     cancel = threading.Event()
+    root = None
 
     def emit(kind: str, data: dict) -> None:
         if kind != "progress":
@@ -29,11 +31,10 @@ def run(report_path: Path, test_url: str | None = None, playlist_url: str | None
         import tkinter as tk
         root = tk.Tk()
         root.withdraw()
-        app = DownloadApp(root)
+        app = DownloadApp(root, report_path.parent / "self-test-history.sqlite3")
         for step in range(4):
             app.show_step(step)
             root.update_idletasks()
-        root.destroy()
         report["checks"]["gui"] = "all four pages constructed"
         with BundledRuntime(cancel) as runtime:
             process = runtime.process
@@ -57,6 +58,16 @@ def run(report_path: Path, test_url: str | None = None, playlist_url: str | None
                       "-c:v", "libx264", "-c:a", "aac", "-shortest", str(fixture)], cancel)
             assert engine.probe(fixture) == {"audio", "video"}
             report["checks"]["media"] = "FFmpeg generated an MKV; FFprobe verified video and audio"
+            history_id = app.history.start(VideoList("자체 검사 기록", [Video(1, "fixture", "합성 영상", "")], False), media)
+            app.history.record_event(history_id, "item", {"row": 0, "state": "완료", "path": str(fixture)})
+            app.history.finish(history_id, "complete")
+            reopened = DownloadHistory(app.history.path)
+            assert reopened.list_downloads()[0]["state"] == "완료"
+            assert reopened.list_videos(history_id)[0]["path"] == str(fixture)
+            app.history_button.invoke()
+            root.update_idletasks()
+            assert app.history_window.items.set("0", "state") == "완료"
+            report["checks"]["history"] = "SQLite persistence and history window verified in an isolated test database"
             if playlist_url:
                 listing = engine.inspect(playlist_url, True)
                 report["checks"]["playlist"] = {"title": listing.title, "count": len(listing.videos)}
@@ -75,5 +86,8 @@ def run(report_path: Path, test_url: str | None = None, playlist_url: str | None
         report["ok"] = True
     except Exception:
         report["error"] = traceback.format_exc()
+    finally:
+        if root is not None:
+            root.destroy()
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return 0 if report["ok"] else 1
