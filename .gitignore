@@ -1,0 +1,8 @@
+.venv/
+.vendor/
+.build-cache/
+build/
+dist/
+output/
+__pycache__/
+*.pyc
